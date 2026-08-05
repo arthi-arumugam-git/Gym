@@ -20,8 +20,6 @@ inference worker, the framework's ``StagingSink`` (staging storage), the gate,
 and the RL controller. They extend #2124's ``TokenEntry`` world: ``TokenEntry``
 (``token_id_capture/records.py``) remains the read-route record rebuilt for
 trainers; the shapes below are what travels while a rollout is in flight.
-Shapes freeze at the S1 review gate; the optional ``chain_hash``/``cum_hash``
-fields are reserved so the hardening layer (H2) is purely additive.
 
 This module is part of the dependency-free capture core (the ``staging``
 subpackage purity rule): stdlib + pydantic only.
@@ -177,3 +175,6 @@ class StagedCallSnapshot(BaseModel):
     weight_version: Optional[int] = None
     parent_call_id: Optional[str] = None
     model: str = ""
+    # Delta-aligned per-token extras round-tripped from ``StagedCallRecord``
+    # (e.g. MoE ``routed_experts``); None when the row staged without them.
+    extras: Optional[dict[str, Any]] = None
