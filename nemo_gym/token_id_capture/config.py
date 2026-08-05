@@ -47,6 +47,14 @@ Uvicorn workers use spawned processes.
 They do not inherit a sink installed by a launcher.
 Configure the sink here so each worker builds its own.
 Programmatic installation must occur inside the serving process.
+
+Choosing who reads them back
+----------------------------
+``rebuild_response`` controls whether Gym rebuilds a finished rollout.
+Gym then swaps the rebuilt trajectory into ``response.output``.
+Set it to false when a framework reads through its own ``TokenSource``.
+Gym then stops after the write.
+Read ownership is independent of write ownership.
 """
 
 from __future__ import annotations
@@ -92,7 +100,8 @@ class TokenIdCaptureSettings(BaseModel):
     # Optional paired reader for framework-owned transports.
     source: str | None = None
     source_kwargs: dict[str, Any] = Field(default_factory=dict)
-    # Rebuild opaque-harness responses from captured records after the run.
+    # Whether Gym reads a rollout's records back after it finishes, builds the trajectory, swaps
+    # it into response.output, attaches build metrics, and retires the sealed snapshot.
     rebuild_response: bool = True
 
 
