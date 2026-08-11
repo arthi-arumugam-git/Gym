@@ -532,6 +532,24 @@ include = [
     "nemo_gym",
     "nemo_gym.*",
 ]
+# The swe_agents server writes runtime state into its own package dir at
+# server startup / rollout time: auto-installed tool trees (swe_*_setup) and
+# rollout outputs (results). Discovery must never descend into them — they
+# are mutated live by running jobs, so a concurrent editable build races
+# against dir create/delete ("package directory ... does not exist"), and
+# they can be huge or on degraded storage. Runtime state, not source.
+exclude = [
+    "responses_api_agents.swe_agents.results",
+    "responses_api_agents.swe_agents.results.*",
+    "responses_api_agents.swe_agents.swe_openhands_setup",
+    "responses_api_agents.swe_agents.swe_openhands_setup.*",
+    "responses_api_agents.swe_agents.swe_r2e_gym_setup",
+    "responses_api_agents.swe_agents.swe_r2e_gym_setup.*",
+    "responses_api_agents.swe_agents.swe_swebench_multilingual_setup",
+    "responses_api_agents.swe_agents.swe_swebench_multilingual_setup.*",
+    "responses_api_agents.swe_agents.swe_swebench_setup",
+    "responses_api_agents.swe_agents.swe_swebench_setup.*",
+]
 
 ################################################
 # Testing
