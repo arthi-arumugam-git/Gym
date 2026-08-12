@@ -122,6 +122,7 @@ class TokenIDLogProbMixin(BaseModel):
     generation_token_ids: List[int]
     generation_log_probs: List[float]
     routed_experts: Optional[RoutedExperts] = None
+    completion_id: Optional[str] = None
 
 
 class TokenIDLogProbTypedDictMixin(TypedDict):
@@ -129,6 +130,7 @@ class TokenIDLogProbTypedDictMixin(TypedDict):
     generation_token_ids: List[int]
     generation_log_probs: List[float]
     routed_experts: NotRequired[RoutedExperts]
+    completion_id: NotRequired[Optional[str]]
 
 
 _REQUIRED_TOKEN_METADATA_FIELDS = frozenset(
@@ -138,7 +140,7 @@ _REQUIRED_TOKEN_METADATA_FIELDS = frozenset(
         "generation_log_probs",
     }
 )
-_TOKEN_METADATA_FIELDS = _REQUIRED_TOKEN_METADATA_FIELDS | {"routed_experts"}
+_TOKEN_METADATA_FIELDS = _REQUIRED_TOKEN_METADATA_FIELDS | {"routed_experts", "completion_id"}
 
 
 def _validate_atomic_token_metadata(value: Any) -> Any:
