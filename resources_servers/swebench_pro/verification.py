@@ -15,45 +15,30 @@
 
 """SWE-bench Pro patch verification using a NeMo Gym sandbox.
 
-This module ports the verification contract from:
+Upstream source:
 https://github.com/scaleapi/SWE-bench_Pro-os/blob/ca10a60a5fcae51e6948ffe1485d4153d421e6c5/swe_bench_pro_eval.py
 
-The upstream file is a standalone evaluator rather than an importable harness
-library. It owns Modal/local-Docker sandbox creation, host workspaces, CSV and
-patch-file loading, thread-pool concurrency, progress reporting, and aggregate
-result persistence. Importing it directly would also require its repository
-layout (``helper_code``, ``run_scripts``, and ``dockerfiles``) plus the Modal,
-Docker, and pandas dependencies. Unlike the upstream SWE-bench package, it does
-not expose a ``run_instance``-style seam where a small container shim can be
-substituted.
+Copied functions retain their upstream names and structure:
 
-Kept equivalent to the pinned upstream evaluator:
+* ``strip_binary_hunks`` is copied verbatim.
+* ``create_entryscript`` is copied with each changed statement marked
+  ``NeMo Gym change``.
+* ``assemble_workspace_files`` is copied with embedded-asset and path changes
+  marked ``NeMo Gym change``.
+* ``grade_output`` extracts the grading statements from upstream ``main``;
+  its safe parsing change is marked inline.
 
-* remove binary hunks from candidate patches;
-* restore ``/app`` to the task's ``base_commit`` and apply ``patch.diff``;
-* restore Dockerfile ``ENV`` declarations and run ``before_repo_set_cmd``;
-* pass the selected test files to the task's ``run_script.sh``;
-* run the task's ``parser.py`` to produce ``output.json``; and
-* resolve only when every fail-to-pass and pass-to-pass test is reported passed.
-
-Changed for NeMo Gym:
-
-* ``AsyncSandbox`` replaces both Modal and the Docker SDK;
-* sandbox lifecycle, concurrency, and request routing belong to the resources
-  server rather than this verifier;
-* evaluator assets are embedded in prepared JSONL rows from pinned upstream
-  revisions instead of read from a checked-out repository at runtime;
-* immutable image digests replace case-sensitive Docker Hub tags because some
-  OpenSandbox registry mirrors normalize tags;
-* list strings are parsed safely instead of using Python ``eval``; and
-* per-request outputs and failure details are retained in Gym's log directory.
+``run_verification`` and the dataclasses are NeMo Gym additions. They replace
+Modal/local-Docker orchestration with ``AsyncSandbox`` and persist per-request
+logs. Dataset preparation supplies the upstream scripts and Dockerfiles in each
+JSONL row, avoiding a runtime checkout of the standalone upstream repository.
 """
 
 import ast
 import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -113,62 +98,98 @@ def parse_string_list(value: str | list[str]) -> list[str]:
 
 
 def strip_binary_hunks(patch: str) -> str:
-    """Remove binary diff sections, matching the public Pro evaluator."""
+    """Remove binary diff sections from a git patch."""
+    if not patch:
+        return patch
+
     sections = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
-    kept = [
-        section
-        for section in sections
-        if section.strip()
-        and not re.search(r"^Binary files .* differ$", section, re.MULTILINE)
-        and not re.search(r"^GIT binary patch$", section, re.MULTILINE)
-    ]
+
+    kept: list[str] = []
+    for section in sections:
+        if not section.strip():
+            continue
+        if re.search(r"^Binary files .* differ$", section, re.MULTILINE):
+            continue
+        if re.search(r"^GIT binary patch$", section, re.MULTILINE):
+            continue
+        kept.append(section)
+
     return "".join(kept)
 
 
-def _dockerfile_environment_exports(*dockerfiles: str) -> str:
-    exports = []
-    for dockerfile in dockerfiles:
-        for raw_line in dockerfile.splitlines():
-            line = raw_line.strip()
-            if line.startswith("ENV "):
-                exports.append(line.replace("ENV ", "export ", 1))
-    return "\n".join(exports)
+def create_entryscript(sample: dict[str, Any]) -> str:
+    """Create the upstream in-container evaluation script."""
+    before_repo_set_cmd = sample["before_repo_set_cmd"].strip().split("\n")[-1]
+    # NeMo Gym change: parse untrusted dataset content safely instead of using eval().
+    selected_test_files_to_run = ",".join(parse_string_list(sample["selected_test_files_to_run"]))
+    base_commit = sample["base_commit"]
+    # NeMo Gym change: Dockerfiles are embedded in the prepared row instead of read from an upstream checkout.
+    base_dockerfile = sample["base_dockerfile"]
+    instance_dockerfile = sample["instance_dockerfile"]
 
+    # Extract ENV commands from dockerfiles
+    env_cmds = []
+    for dockerfile_content in [base_dockerfile, instance_dockerfile]:
+        for line in dockerfile_content.split("\n"):
+            line = line.strip()
+            if line.startswith("ENV"):
+                # Convert ENV commands to export statements
+                env_cmd = line.replace("ENV", "export", 1)
+                env_cmds.append(env_cmd)
 
-def build_entry_script(inputs: VerificationInputs) -> str:
-    """Build the in-sandbox evaluator script from trusted benchmark metadata."""
-    selected_tests = ",".join(parse_string_list(inputs.selected_test_files_to_run))
-    setup_lines = [line.strip() for line in inputs.before_repo_set_cmd.splitlines() if line.strip()]
-    setup_command = setup_lines[-1] if setup_lines else ":"
-    environment_exports = _dockerfile_environment_exports(inputs.base_dockerfile, inputs.instance_dockerfile)
+    env_cmds = "\n".join(env_cmds)
 
-    return f"""#!/bin/bash
-set +e
-{environment_exports}
-cd {shlex.quote(REPOSITORY_DIR)} || exit 1
-git reset --hard {shlex.quote(inputs.base_commit)}
-git checkout {shlex.quote(inputs.base_commit)}
-git apply -v {shlex.quote(PATCH_PATH)}
+    entry_script = f"""
+{env_cmds}
+# apply patch
+cd /app
+git reset --hard {base_commit}
+git checkout {base_commit}
+git apply -v /workspace/patch.diff
+# NeMo Gym change: retain patch application status for the structured verification response.
 PATCH_APPLY_STATUS=$?
-{setup_command}
-bash {shlex.quote(RUN_SCRIPT_PATH)} {shlex.quote(selected_tests)} > {shlex.quote(STDOUT_PATH)} 2> {shlex.quote(STDERR_PATH)}
-python {shlex.quote(PARSER_PATH)} {shlex.quote(STDOUT_PATH)} {shlex.quote(STDERR_PATH)} {shlex.quote(OUTPUT_PATH)}
-PARSER_STATUS=$?
-printf '%s\\n' "$PATCH_APPLY_STATUS" > {shlex.quote(WORKSPACE_DIR + "/patch_apply_status")}
-exit "$PARSER_STATUS"
+{before_repo_set_cmd}
+# run test and save stdout and stderr to separate files
+bash /workspace/run_script.sh {selected_test_files_to_run} > /workspace/stdout.log 2> /workspace/stderr.log
+# run parsing script
+python /workspace/parser.py /workspace/stdout.log /workspace/stderr.log /workspace/output.json
+# NeMo Gym change: persist the status after running the upstream script sequence.
+printf '%s\\n' "$PATCH_APPLY_STATUS" > /workspace/patch_apply_status
 """
+    return entry_script
 
 
-def required_tests_passed(
-    test_results: dict[str, Any], fail_to_pass: str | list[str], pass_to_pass: str | list[str]
-) -> bool:
-    required = set(parse_string_list(fail_to_pass)) | set(parse_string_list(pass_to_pass))
-    passed = {
-        test["name"]
-        for test in test_results.get("tests", [])
-        if isinstance(test, dict) and test.get("status") == "PASSED" and isinstance(test.get("name"), str)
+def assemble_workspace_files(
+    uid: str,
+    scripts_dir: str | None,
+    patch: str,
+    sample: dict[str, Any],
+) -> tuple[dict[str, str], str]:
+    """Assemble the files expected by the upstream evaluator workspace."""
+    # NeMo Gym change: scripts are embedded in the prepared row; scripts_dir is retained to match upstream's signature.
+    del uid, scripts_dir
+    run_script = sample["run_script"]
+    parser_script = sample["parser_script"]
+    entryscript_content = create_entryscript(sample)
+
+    cleaned_patch = strip_binary_hunks(patch)
+
+    files = {
+        "patch.diff": cleaned_patch,
+        "run_script.sh": run_script,
+        "parser.py": parser_script,
+        "entryscript.sh": entryscript_content,
     }
-    return bool(required) and required <= passed
+    return files, entryscript_content
+
+
+def grade_output(output: dict[str, Any], sample: dict[str, Any]) -> bool:
+    """Grade one parser output using the statements extracted from upstream main()."""
+    passed_tests = {x["name"] for x in output["tests"] if x["status"] == "PASSED"}
+    # NeMo Gym change: parse untrusted dataset content safely instead of using eval().
+    f2p = set(parse_string_list(sample["fail_to_pass"]))
+    p2p = set(parse_string_list(sample["pass_to_pass"]))
+    return (f2p | p2p) <= passed_tests
 
 
 async def run_verification(
@@ -178,10 +199,10 @@ async def run_verification(
     timeout_s: int | None,
 ) -> VerificationResult:
     """Apply one patch, execute Pro's task scripts, and grade their JSON output."""
-    cleaned_patch = strip_binary_hunks(inputs.patch)
-    entry_script = build_entry_script(inputs)
+    sample = asdict(inputs)
+    files, entry_script = assemble_workspace_files(inputs.instance_id, None, inputs.patch, sample)
     log_dir.mkdir(parents=True, exist_ok=True)
-    (log_dir / "patch.diff").write_text(cleaned_patch, encoding="utf-8")
+    (log_dir / "patch.diff").write_text(files["patch.diff"], encoding="utf-8")
     (log_dir / "eval.sh").write_text(entry_script, encoding="utf-8")
 
     await sandbox.exec(f"chmod +x {shlex.quote(RUN_SCRIPT_PATH)} {shlex.quote(ENTRY_SCRIPT_PATH)}")
@@ -244,7 +265,7 @@ async def run_verification(
             error="Parser output must be a JSON object",
         )
 
-    resolved = patch_applied and required_tests_passed(test_results, inputs.fail_to_pass, inputs.pass_to_pass)
+    resolved = patch_applied and grade_output(test_results, sample)
     return VerificationResult(
         completed=execution.return_code == 0,
         resolved=resolved,

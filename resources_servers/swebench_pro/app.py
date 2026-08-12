@@ -17,6 +17,7 @@
 
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from shlex import quote
 from time import time
@@ -39,15 +40,10 @@ from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.server_utils import SESSION_ID_KEY
 from resources_servers.swebench_pro.verification import (
-    ENTRY_SCRIPT_PATH,
-    PARSER_PATH,
-    PATCH_PATH,
-    RUN_SCRIPT_PATH,
     VerificationInputs,
     VerificationResult,
-    build_entry_script,
+    assemble_workspace_files,
     run_verification,
-    strip_binary_hunks,
 )
 
 
@@ -237,12 +233,9 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
                 extraction_error = f"Failed to extract model patch: {exc}"
 
         inputs = self._verification_inputs(body, model_patch)
-        entry_script = build_entry_script(inputs)
+        workspace_files, _ = assemble_workspace_files(body.instance_id, None, model_patch, asdict(inputs))
         sandbox_files = {
-            PATCH_PATH: strip_binary_hunks(model_patch),
-            RUN_SCRIPT_PATH: body.run_script,
-            PARSER_PATH: body.parser_script,
-            ENTRY_SCRIPT_PATH: entry_script,
+            f"/workspace/{relative_path}": contents for relative_path, contents in workspace_files.items()
         }
 
         run_log_dir = Path(__file__).parent / "logs" / "run_evaluation" / session_id / body.instance_id

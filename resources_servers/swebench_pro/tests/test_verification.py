@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -21,9 +22,10 @@ import pytest
 
 from resources_servers.swebench_pro.verification import (
     VerificationInputs,
-    build_entry_script,
+    assemble_workspace_files,
+    create_entryscript,
+    grade_output,
     parse_string_list,
-    required_tests_passed,
     run_verification,
     strip_binary_hunks,
 )
@@ -63,12 +65,12 @@ def test_strip_binary_hunks_preserves_text_diffs() -> None:
     assert strip_binary_hunks(patch) == "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
 
 
-def test_build_entry_script_matches_pro_contract() -> None:
+def test_create_entryscript_matches_upstream_contract() -> None:
     inputs = make_inputs(
         before_repo_set_cmd="ignored setup line\nnpm install",
         base_dockerfile="ENV FOO=bar\n",
     )
-    script = build_entry_script(inputs)
+    script = create_entryscript(asdict(inputs))
     assert "git reset --hard abc123" in script
     assert "git apply -v /workspace/patch.diff" in script
     assert "npm install" in script
@@ -76,16 +78,26 @@ def test_build_entry_script_matches_pro_contract() -> None:
     assert "export FOO=bar" in script
 
 
-def test_required_tests_passed_requires_all_named_tests() -> None:
+def test_assemble_workspace_files_embeds_prepared_assets() -> None:
+    inputs = make_inputs(patch="diff --git a/image.png b/image.png\nGIT binary patch\nliteral 1\nA\n")
+    files, entryscript = assemble_workspace_files(inputs.instance_id, None, inputs.patch, asdict(inputs))
+
+    assert files["patch.diff"] == ""
+    assert files["run_script.sh"] == inputs.run_script
+    assert files["parser.py"] == inputs.parser_script
+    assert files["entryscript.sh"] == entryscript
+
+
+def test_grade_output_requires_all_named_tests() -> None:
     output = {
         "tests": [
             {"name": "test_new", "status": "PASSED"},
             {"name": "test_old", "status": "PASSED"},
         ]
     }
-    assert required_tests_passed(output, '["test_new"]', '["test_old"]')
-    assert not required_tests_passed(output, '["missing"]', '["test_old"]')
-    assert not required_tests_passed(output, "[]", "[]")
+    assert grade_output(output, asdict(make_inputs()))
+    assert not grade_output(output, asdict(make_inputs(fail_to_pass='["missing"]')))
+    assert grade_output(output, asdict(make_inputs(fail_to_pass="[]", pass_to_pass="[]")))
 
 
 @pytest.mark.asyncio
