@@ -28,9 +28,9 @@ from datasets import load_dataset
 from nemo_gym.global_config import get_hf_token
 
 
-UPSTREAM_COMMIT = "ca10a60a5fcae51e6948ffe1485d4153d421e6c5"
+UPSTREAM_COMMIT = "ca10a60a5fcae51e6948ffe1485d4153d421e6c5"  # pragma: allowlist secret
 UPSTREAM_ARCHIVE_URL = f"https://github.com/scaleapi/SWE-bench_Pro-os/archive/{UPSTREAM_COMMIT}.tar.gz"
-DATASET_REVISION = "7ab5114912baf22bb098818e604c02fe7ad2c11f"
+DATASET_REVISION = "7ab5114912baf22bb098818e604c02fe7ad2c11f"  # pragma: allowlist secret
 EXPECTED_INSTANCE_COUNT = 731
 BENCHMARK_DIR = Path(__file__).parent.parent
 DATA_DIR = BENCHMARK_DIR / "data"
