@@ -20,7 +20,9 @@ import tarfile
 import urllib.request
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+from time import sleep
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import quote
 
 from datasets import load_dataset
@@ -61,15 +63,50 @@ def _read_asset(upstream_root: Path, relative_path: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def fetch_image_digest(dockerhub_tag: str) -> str:
+def fetch_image_digest(dockerhub_tag: str, max_attempts: int = 8) -> str:
     """Resolve a case-sensitive Docker Hub tag to an immutable digest."""
     url = f"https://hub.docker.com/v2/repositories/jefzda/sweap-images/tags/{quote(dockerhub_tag, safe='')}"
-    with urllib.request.urlopen(url) as response:
-        metadata = json.load(response)
+    for attempt in range(max_attempts):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                metadata = json.load(response)
+            break
+        except HTTPError as exc:
+            if exc.code != 429 or attempt == max_attempts - 1:
+                raise
+            retry_after = exc.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after else min(2**attempt, 60)
+            print(f"Docker Hub rate-limited {dockerhub_tag}; retrying in {delay:g}s")
+            sleep(delay)
     digest = metadata.get("digest")
     if not isinstance(digest, str) or not digest.startswith("sha256:"):
         raise ValueError(f"Docker Hub did not return a digest for {dockerhub_tag}")
     return digest
+
+
+def _load_digest_cache(*paths: Path) -> dict[str, str]:
+    cache: dict[str, str] = {}
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            if path.suffix == ".json":
+                values = json.loads(path.read_text(encoding="utf-8"))
+                cache.update({str(tag): str(digest) for tag, digest in values.items()})
+            else:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    row = json.loads(line)
+                    if row.get("dockerhub_tag") and row.get("image_digest"):
+                        cache[str(row["dockerhub_tag"])] = str(row["image_digest"])
+        except (json.JSONDecodeError, OSError):
+            continue
+    return cache
+
+
+def _write_digest_cache(path: Path, cache: Mapping[str, str]) -> None:
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary_path.replace(path)
 
 
 def enrich_row(row: Mapping[str, Any], upstream_root: Path, image_digest: str) -> dict[str, Any]:
@@ -107,6 +144,7 @@ def prepare(
     upstream_root: Path | None = None,
     output_fpath: Path = OUTPUT_FPATH,
     image_digest_resolver=fetch_image_digest,
+    image_digest_cache_fpath: Path | None = None,
 ) -> Path:
     """Materialize the public Pro split as self-contained NeMo Gym JSONL."""
     if dataset is None:
@@ -120,10 +158,19 @@ def prepare(
         upstream_root = fetch_upstream_assets()
 
     output_fpath.parent.mkdir(parents=True, exist_ok=True)
+    if image_digest_cache_fpath is None:
+        image_digest_cache_fpath = output_fpath.parent / "swebench_pro_image_digests.json"
+    output_tmp_fpath = output_fpath.with_suffix(output_fpath.suffix + ".tmp")
+    digest_cache = _load_digest_cache(image_digest_cache_fpath, output_fpath, output_tmp_fpath)
     count = 0
-    with output_fpath.open("w", encoding="utf-8") as output:
+    with output_tmp_fpath.open("w", encoding="utf-8") as output:
         for row in dataset:
-            image_digest = image_digest_resolver(str(row["dockerhub_tag"]))
+            dockerhub_tag = str(row["dockerhub_tag"])
+            image_digest = digest_cache.get(dockerhub_tag)
+            if image_digest is None:
+                image_digest = image_digest_resolver(dockerhub_tag)
+                digest_cache[dockerhub_tag] = image_digest
+                _write_digest_cache(image_digest_cache_fpath, digest_cache)
             output.write(json.dumps(enrich_row(row, upstream_root, image_digest)) + "\n")
             count += 1
     if count == 0:
@@ -131,6 +178,7 @@ def prepare(
     if dataset is not None and hasattr(dataset, "num_rows") and count != EXPECTED_INSTANCE_COUNT:
         raise ValueError(f"Expected {EXPECTED_INSTANCE_COUNT} SWE-bench Pro rows, got {count}")
 
+    output_tmp_fpath.replace(output_fpath)
     print(f"Wrote {count} SWE-bench Pro problems to {output_fpath}")
     return output_fpath
 

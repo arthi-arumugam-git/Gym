@@ -14,9 +14,12 @@
 # limitations under the License.
 
 import json
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
-from benchmarks.swebench.pro.prepare import UPSTREAM_COMMIT, enrich_row, prepare
+from benchmarks.swebench.pro import prepare as prepare_module
+from benchmarks.swebench.pro.prepare import UPSTREAM_COMMIT, enrich_row, fetch_image_digest, prepare
 
 
 def make_upstream(root: Path, instance_id: str) -> None:
@@ -32,10 +35,10 @@ def make_upstream(root: Path, instance_id: str) -> None:
         path.write_text(contents, encoding="utf-8")
 
 
-def dataset_row() -> dict:
+def dataset_row(instance_id: str = "instance_example", dockerhub_tag: str = "example-tag") -> dict:
     return {
         "repo": "example/repo",
-        "instance_id": "instance_example",
+        "instance_id": instance_id,
         "base_commit": "abc123",
         "patch": "patch",
         "test_patch": "",
@@ -44,7 +47,7 @@ def dataset_row() -> dict:
         "pass_to_pass": '["old_test"]',
         "before_repo_set_cmd": "",
         "selected_test_files_to_run": '["tests"]',
-        "dockerhub_tag": "example-tag",
+        "dockerhub_tag": dockerhub_tag,
     }
 
 
@@ -76,3 +79,45 @@ def test_prepare_writes_self_contained_jsonl(tmp_path) -> None:
     prepared = json.loads(output.read_text(encoding="utf-8"))
     assert prepared["instance_id"] == "instance_example"
     assert prepared["parser_script"] == "print('parser')\n"
+
+
+def test_fetch_image_digest_retries_docker_hub_rate_limit(monkeypatch) -> None:
+    rate_limit = HTTPError("https://hub.docker.com", 429, "Too Many Requests", {"Retry-After": "0"}, None)
+    response = BytesIO(b'{"digest": "sha256:digest"}')
+    urlopen = iter([rate_limit, response])
+
+    def open_response(*args, **kwargs):
+        result = next(urlopen)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(prepare_module, "sleep", lambda _: None)
+    monkeypatch.setattr(prepare_module.urllib.request, "urlopen", open_response)
+
+    assert fetch_image_digest("example-tag") == "sha256:digest"
+
+
+def test_prepare_recovers_digests_from_partial_output(tmp_path) -> None:
+    make_upstream(tmp_path, "instance_example")
+    make_upstream(tmp_path, "instance_second")
+    output = tmp_path / "output.jsonl"
+    output.write_text(
+        json.dumps({"dockerhub_tag": "cached-tag", "image_digest": "sha256:cached"}) + "\n",
+        encoding="utf-8",
+    )
+    resolved_tags = []
+
+    prepare(
+        dataset=[
+            dataset_row(dockerhub_tag="cached-tag"),
+            dataset_row("instance_second", "new-tag"),
+        ],
+        upstream_root=tmp_path,
+        output_fpath=output,
+        image_digest_resolver=lambda tag: resolved_tags.append(tag) or "sha256:new",
+    )
+
+    prepared = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert resolved_tags == ["new-tag"]
+    assert [row["image_digest"] for row in prepared] == ["sha256:cached", "sha256:new"]

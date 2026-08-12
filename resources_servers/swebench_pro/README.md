@@ -13,7 +13,7 @@ test to pass.
 ## Prepare data
 
 ```bash
-gym eval prepare --config benchmarks/swebench/pro/opencode.yaml
+uv run python benchmarks/swebench/pro/prepare.py
 ```
 
 Preparation pins and embeds the task-specific run scripts, parsers, and Dockerfile metadata from the upstream
