@@ -67,6 +67,12 @@ class RebuiltEntry:
     weight_version: Optional[int] = None
 
 
+# Fallback marker for token positions with no captured route: an all--1 row
+# tells the trainer's router replay to fall back to its own top-k for exactly
+# those tokens (mirrors NeMo-RL's ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL).
+MISSING_ROUTE_SENTINEL = -1
+
+
 @dataclass(frozen=True)
 class LinearizedRow:
     """One training row: the flattened delivered chain of a rollout.
@@ -74,7 +80,10 @@ class LinearizedRow:
     ``token_mask`` is 1.0 exactly on policy-sampled tokens; ``logprobs`` is
     0.0 off-mask. ``call_ids`` lists the chain's calls root-first, and
     ``prompt_len`` is the length of the root call's carried prompt (the
-    row's untrained prefix)."""
+    row's untrained prefix). ``routed_experts`` is the per-token MoE route
+    record ``[len(token_ids)][num_moe_layers][topk]`` rebuilt from staged
+    extras, with all-sentinel rows where no call captured a route; ``None``
+    when no snapshot staged extras (router replay off)."""
 
     rollout_id: str
     token_ids: list[int]
@@ -83,6 +92,7 @@ class LinearizedRow:
     call_ids: list[str]
     prompt_len: int
     weight_versions: list[int] = field(default_factory=list)
+    routed_experts: Optional[list] = None
 
 
 def _carry_boundary(snapshot: StagedCallSnapshot) -> int:
@@ -247,6 +257,13 @@ def linearize(
         weight_version = getattr(link.entry, "weight_version", None)
         weight_versions.append(0 if weight_version is None else int(weight_version))
 
+    routed_experts = _linearize_routed_experts(chain, snapshots)
+    if routed_experts is not None and len(routed_experts) != len(token_ids):
+        raise RebuildError(
+            f"rebuilt routed_experts spans {len(routed_experts)} tokens for a "
+            f"{len(token_ids)}-token row"
+        )
+
     return LinearizedRow(
         rollout_id=rollout_id,
         token_ids=token_ids,
@@ -255,4 +272,56 @@ def linearize(
         call_ids=call_ids,
         prompt_len=len(chain.root_prompt),
         weight_versions=weight_versions,
+        routed_experts=routed_experts,
     )
+
+
+def _routes_template_dims(snapshots: list[StagedCallSnapshot]) -> Optional[tuple[int, int]]:
+    """(num_moe_layers, topk) from the first staged route row, or None."""
+    for snapshot in snapshots:
+        routes = (snapshot.extras or {}).get("routed_experts")
+        if routes and routes[0] and routes[0][0]:
+            return (len(routes[0]), len(routes[0][0]))
+    return None
+
+
+def _linearize_routed_experts(
+    chain: Chain, snapshots: list[StagedCallSnapshot]
+) -> Optional[list]:
+    """Concatenate per-call routed-expert deltas along the delivered chain.
+
+    Each call's staged delta routes cover its prompt-carry prefix plus its
+    generated tokens, in that order -- the same walk ``linearize`` takes for
+    token ids, so full-coverage rollouts reproduce every token's route from
+    the call that first delivered it. Degradation is per-span and honest:
+    a call whose extras are missing or misaligned contributes all-sentinel
+    rows (carry-only when at least the generated tail aligns), and the
+    trainer's replay falls back to its own router for exactly those tokens.
+    Returns ``None`` when no snapshot carries extras (router replay off).
+    """
+    dims = _routes_template_dims(snapshots)
+    if dims is None:
+        return None
+    num_moe_layers, topk = dims
+    sentinel_row = [[MISSING_ROUTE_SENTINEL] * topk for _ in range(num_moe_layers)]
+    routes_by_call = {
+        snapshot.call_id: (snapshot.extras or {}).get("routed_experts")
+        for snapshot in snapshots
+    }
+
+    routed_experts: list = []
+    for step, link in enumerate(chain.links):
+        carry_len = len(chain.root_prompt) if step == 0 else len(link.interstitial)
+        gen_len = len(link.entry.generation_token_ids)
+        expected = carry_len + gen_len
+        routes = routes_by_call.get(link.entry.model_call_id)
+        if routes and len(routes) == expected:
+            routed_experts.extend(routes)
+        elif routes and 0 < gen_len <= len(routes):
+            # The delta tail is always the generated segment; a carry span
+            # the builder recomputed (merged prefix) falls back per-token.
+            routed_experts.extend([sentinel_row] * carry_len)
+            routed_experts.extend(routes[len(routes) - gen_len :])
+        else:
+            routed_experts.extend([sentinel_row] * expected)
+    return routed_experts

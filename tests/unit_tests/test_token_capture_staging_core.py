@@ -314,6 +314,66 @@ def test_linearize_snapshot_manifest_mismatch() -> None:
         linearize("r", snapshots, list(reversed(manifest)))
 
 
+def _routes_for(call_idx: int, n_tokens: int) -> list:
+    """Recognizable [n_tokens][L=2][K=2] route rows: value = call*1000 + pos."""
+    return [
+        [[call_idx * 1000 + pos, call_idx * 1000 + pos + 500] for _ in range(2)]
+        for pos in range(n_tokens)
+    ]
+
+
+def _with_extras(snapshot: StagedCallSnapshot, routes: list | None) -> StagedCallSnapshot:
+    if routes is None:
+        return snapshot
+    return snapshot.model_copy(update={"extras": {"routed_experts": routes}})
+
+
+def test_linearize_routed_experts_full_coverage() -> None:
+    r1 = _routes_for(1, 5)  # covers carry [10,11,12] + gen [13,14]
+    r2 = _routes_for(2, 5)  # covers carry [20,21,22] + gen [23,24]
+    snapshots = [
+        _with_extras(_snapshot("c1", 0, [10, 11, 12], [13, 14], wv=4), r1),
+        _with_extras(_snapshot("c2", 5, [20, 21, 22], [23, 24], parent="c1", wv=4), r2),
+    ]
+    row = linearize("r", snapshots, _manifest_for("r", snapshots), terminal_hint="c2")
+    assert row.routed_experts == r1 + r2
+    assert len(row.routed_experts) == len(row.token_ids)
+
+
+def test_linearize_routed_experts_missing_call_gets_sentinel_span() -> None:
+    r1 = _routes_for(1, 5)
+    snapshots = [
+        _with_extras(_snapshot("c1", 0, [10, 11, 12], [13, 14], wv=1), r1),
+        _snapshot("c2", 5, [20, 21, 22], [23, 24], parent="c1", wv=1),  # no extras
+    ]
+    row = linearize("r", snapshots, _manifest_for("r", snapshots), terminal_hint="c2")
+    assert row.routed_experts[:5] == r1
+    sentinel_row = [[-1, -1], [-1, -1]]
+    assert row.routed_experts[5:] == [sentinel_row] * 5
+    assert len(row.routed_experts) == len(row.token_ids)
+
+
+def test_linearize_routed_experts_misaligned_carry_keeps_generated_tail() -> None:
+    # Routes cover only 4 of the call's 5 delta tokens: carry span is not
+    # trustworthy, but the generated tail (last 2) always is.
+    short = _routes_for(1, 4)
+    snapshots = [_with_extras(_snapshot("c1", 0, [10, 11, 12], [13, 14], wv=1), short)]
+    row = linearize("r", snapshots, _manifest_for("r", snapshots), terminal_hint="c1")
+    sentinel_row = [[-1, -1], [-1, -1]]
+    assert row.routed_experts[:3] == [sentinel_row] * 3
+    assert row.routed_experts[3:] == short[2:]
+    assert len(row.routed_experts) == len(row.token_ids)
+
+
+def test_linearize_routed_experts_absent_everywhere_is_none() -> None:
+    snapshots = [
+        _snapshot("c1", 0, [10, 11], [12], wv=1),
+        _snapshot("c2", 3, [20], [21], parent="c1", wv=1),
+    ]
+    row = linearize("r", snapshots, _manifest_for("r", snapshots), terminal_hint="c2")
+    assert row.routed_experts is None
+
+
 # ---------------------------------------------------------------------------
 # purity: the staging core must import with no heavy dependencies
 # ---------------------------------------------------------------------------
