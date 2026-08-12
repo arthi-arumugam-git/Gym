@@ -264,7 +264,9 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
         command = f"""
         echo "Shell: $SHELL" \
         && {conda_activate_command_str} \
-        && curl -fsSL https://opencode.ai/install | VERSION={self.config.opencode_version} bash \
+        && {{ command -v curl >/dev/null && curl -fsSL https://opencode.ai/install \
+            || python3 -c 'import sys, urllib.request; sys.stdout.buffer.write(urllib.request.urlopen("https://opencode.ai/install").read())'; }} \
+            | VERSION={self.config.opencode_version} bash \
         && export PATH=$HOME/.opencode/bin:$PATH \
         && opencode run {opencode_debug_str} {opencode_thinking_str} {quote(query)}
         """
@@ -305,7 +307,7 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
 
         try:
             pwd_result = await sandbox.exec(command="pwd")
-            results_remote_fpath = Path(pwd_result.stdout) / export_fname
+            results_remote_fpath = Path(str(pwd_result.stdout).strip()) / export_fname
         except:
             print("Failed to get current working directory", format_exc(), file=sys.stderr)
             results_remote_fpath = None

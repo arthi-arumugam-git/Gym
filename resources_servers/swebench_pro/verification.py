@@ -13,7 +13,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SWE-bench Pro patch verification using a NeMo Gym sandbox."""
+"""SWE-bench Pro patch verification using a NeMo Gym sandbox.
+
+This module ports the verification contract from:
+https://github.com/scaleapi/SWE-bench_Pro-os/blob/ca10a60a5fcae51e6948ffe1485d4153d421e6c5/swe_bench_pro_eval.py
+
+The upstream file is a standalone evaluator rather than an importable harness
+library. It owns Modal/local-Docker sandbox creation, host workspaces, CSV and
+patch-file loading, thread-pool concurrency, progress reporting, and aggregate
+result persistence. Importing it directly would also require its repository
+layout (``helper_code``, ``run_scripts``, and ``dockerfiles``) plus the Modal,
+Docker, and pandas dependencies. Unlike the upstream SWE-bench package, it does
+not expose a ``run_instance``-style seam where a small container shim can be
+substituted.
+
+Kept equivalent to the pinned upstream evaluator:
+
+* remove binary hunks from candidate patches;
+* restore ``/app`` to the task's ``base_commit`` and apply ``patch.diff``;
+* restore Dockerfile ``ENV`` declarations and run ``before_repo_set_cmd``;
+* pass the selected test files to the task's ``run_script.sh``;
+* run the task's ``parser.py`` to produce ``output.json``; and
+* resolve only when every fail-to-pass and pass-to-pass test is reported passed.
+
+Changed for NeMo Gym:
+
+* ``AsyncSandbox`` replaces both Modal and the Docker SDK;
+* sandbox lifecycle, concurrency, and request routing belong to the resources
+  server rather than this verifier;
+* evaluator assets are embedded in prepared JSONL rows from pinned upstream
+  revisions instead of read from a checked-out repository at runtime;
+* immutable image digests replace case-sensitive Docker Hub tags because some
+  OpenSandbox registry mirrors normalize tags;
+* list strings are parsed safely instead of using Python ``eval``; and
+* per-request outputs and failure details are retained in Gym's log directory.
+"""
 
 import ast
 import json
