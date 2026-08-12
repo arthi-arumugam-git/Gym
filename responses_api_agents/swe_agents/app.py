@@ -2834,6 +2834,61 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
         return messages, tools
 
+    @staticmethod
+    def _attach_routed_experts_from_completions(messages: list, completion_files: list) -> None:
+        """Give every tokenized history message full-sequence routed_experts.
+
+        The harness restores only prompt/generation token ids and logprobs onto
+        history messages, so on multi-turn trajectories the intermediate
+        assistant messages arrive without routes. Only the last call's
+        completion file reliably persists, but its recorded routes cover the
+        entire conversation (prompt prefill + final generation), and the
+        trainer slices each item's routes by absolute sequence position — so
+        the final call's full-coverage routes are valid for every earlier
+        message on the same contiguous token prefix (contiguity is asserted
+        downstream). litellm keeps routed_experts as a response-message
+        attribute without mirroring it into provider_specific_fields
+        (observed on litellm 1.77.7), so read the recorded response message
+        with psf as the preferred source. No-op when routes were never
+        recorded (router replay off).
+        """
+        pending = [
+            m
+            for m in messages
+            if m.get("generation_token_ids") and m.get("routed_experts") is None
+        ]
+        if not pending:
+            return
+        full_routes = None
+        for fpath in reversed(list(completion_files)):
+            try:
+                with open(fpath, "r") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            fields = data.get("provider_specific_fields") or {}
+            try:
+                response_message = (data.get("response") or {})["choices"][0][
+                    "message"
+                ] or {}
+            except (KeyError, IndexError, TypeError):
+                response_message = {}
+            full_routes = fields.get("routed_experts") or response_message.get(
+                "routed_experts"
+            )
+            if full_routes is not None:
+                break
+        if full_routes is None:
+            print(
+                f"r3_stitch_no_routes: {len(pending)} tokenized messages have no "
+                f"routes and no completion file recorded any (n_files="
+                f"{len(completion_files)})",
+                flush=True,
+            )
+            return
+        for message in pending:
+            message["routed_experts"] = full_routes
+
     def get_openhands_trajectory_from_completions(self, trajectories_dir: Path, instance_id: str) -> tuple:
         """Extract the main session's trajectory for the API response.
 
@@ -2886,6 +2941,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 main_data = json.load(f)
 
         messages, tools = self._materialize_trajectory(main_data)
+        self._attach_routed_experts_from_completions(messages, completion_files)
         return messages, tools, first_prefix_count
 
     def get_all_session_trajectories_from_completions(self, trajectories_dir: Path, instance_id: str) -> list[dict]:

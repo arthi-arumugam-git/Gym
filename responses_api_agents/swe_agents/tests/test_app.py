@@ -2491,3 +2491,128 @@ class TestLoadRebenchLogParsers:
 
             mod = _load_rebench_log_parsers(rebench_dir)
             assert "lib_test" in mod.NAME_TO_PARSER
+
+
+class TestAttachRoutedExpertsFromCompletions:
+    """Router replay (R3): intermediate history messages get their own call's routes."""
+
+    def test_full_sequence_routes_attach_to_all_tokenized_messages(self, tmp_path):
+        # Only the last call's file persists; its routes cover the whole
+        # conversation and the trainer slices by absolute position — every
+        # routeless tokenized message gets the same full-coverage value.
+        full_routes = "nrlre1:int16:5x1x2:AAAA"
+        (tmp_path / "b.json").write_text(
+            json.dumps(
+                {
+                    "provider_specific_fields": {
+                        "prompt_token_ids": [1, 2, 7, 9],
+                        "generation_token_ids": [8],
+                        "generation_log_probs": [-0.2],
+                    },
+                    "response": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "z",
+                                    "routed_experts": full_routes,
+                                }
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        messages = [
+            {"role": "user", "content": "x"},
+            {
+                "role": "assistant",
+                "content": "y",
+                "prompt_token_ids": [1, 2],
+                "generation_token_ids": [7],
+                "generation_log_probs": [-0.1],
+            },
+            {
+                "role": "assistant",
+                "content": "z",
+                "prompt_token_ids": [1, 2, 7, 9],
+                "generation_token_ids": [8],
+                "generation_log_probs": [-0.2],
+                "routed_experts": full_routes,
+            },
+        ]
+        SWEBenchWrapper._attach_routed_experts_from_completions(
+            messages, sorted(tmp_path.glob("*.json"))
+        )
+        assert messages[1]["routed_experts"] == full_routes
+        assert "routed_experts" not in messages[0]
+        assert messages[2]["routed_experts"] == full_routes
+
+    def test_noop_when_no_routes_recorded(self, tmp_path):
+        (tmp_path / "a.json").write_text(
+            json.dumps(
+                {
+                    "provider_specific_fields": {
+                        "prompt_token_ids": [1, 2],
+                        "generation_token_ids": [7],
+                        "generation_log_probs": [-0.1],
+                    }
+                }
+            )
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": "y",
+                "prompt_token_ids": [1, 2],
+                "generation_token_ids": [7],
+                "generation_log_probs": [-0.1],
+            }
+        ]
+        SWEBenchWrapper._attach_routed_experts_from_completions(
+            messages, sorted(tmp_path.glob("*.json"))
+        )
+        assert "routed_experts" not in messages[0]
+
+    def test_prefers_latest_file_with_routes(self, tmp_path):
+        # Files are scanned newest-first; an older file's routes are only a
+        # fallback when the newest lacks them.
+        (tmp_path / "a.json").write_text(
+            json.dumps(
+                {
+                    "provider_specific_fields": {
+                        "routed_experts": "nrlre1:int8:1x1x2:OLD1",
+                        "generation_token_ids": [7],
+                    }
+                }
+            )
+        )
+        (tmp_path / "b.json").write_text(
+            json.dumps(
+                {
+                    "provider_specific_fields": {"generation_token_ids": [8]},
+                    "response": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "routed_experts": "nrlre1:int8:2x1x2:NEW1",
+                                }
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": "y",
+                "prompt_token_ids": [1, 2],
+                "generation_token_ids": [7],
+            }
+        ]
+        SWEBenchWrapper._attach_routed_experts_from_completions(
+            messages, sorted(tmp_path.glob("*.json"))
+        )
+        assert messages[0]["routed_experts"] == "nrlre1:int8:2x1x2:NEW1"
