@@ -20,8 +20,8 @@ swebench_pro_resources_server:
           disk_gib: 30
         provider_options:
           resource_requests:
-            cpu: 1
-            memory_mib: 5120
+            cpu: 4
+            memory_mib: 30720
             disk_gib: 30
         metadata:
           benchmark: swebench-pro
@@ -47,8 +47,8 @@ swebench_pro_example_resources_server:
           disk_gib: 30
         provider_options:
           resource_requests:
-            cpu: 1
-            memory_mib: 5120
+            cpu: 4
+            memory_mib: 30720
             disk_gib: 30
         metadata:
           benchmark: swebench-pro-example
