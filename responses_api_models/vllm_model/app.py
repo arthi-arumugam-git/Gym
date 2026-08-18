@@ -853,7 +853,9 @@ class VLLMModel(SimpleResponsesAPIModel):
                     if key in body_dict:
                         tokenize_body_dict[key] = body_dict[key]
 
-                # The base url has /v1 at the end but vLLM's tokenize endpoint does not have v1, hence the ..
+                # The base URL ends in ``/v1``.
+                # The vLLM tokenize endpoint omits ``/v1``.
+                # The relative path therefore starts with ``..``.
                 tokenize_response = await client.create_tokenize(**tokenize_body_dict)
                 prompt_token_ids = tokenize_response["tokens"]
             else:
@@ -865,7 +867,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             message_dict = choice_dict["message"]
             message_dict.update(
                 dict(
-                    # TODO add this when NeMo RL upgrades to vLLM 0.10.2 support for prompt token ids
+                    # TODO: Add this after NeMo RL supports prompt token IDs with vLLM 0.10.2.
                     # prompt_token_ids=chat_completion_dict["prompt_token_ids"],
                     prompt_token_ids=prompt_token_ids,
                     # generation_token_ids=choice_dict["token_ids"],
