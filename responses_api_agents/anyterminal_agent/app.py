@@ -14,6 +14,7 @@
 import asyncio
 import hashlib
 import json
+import shlex
 import shutil
 import sys
 import tarfile
@@ -120,16 +121,16 @@ def update_metrics(metrics_fpath: Path, update_dict: Dict[str, Any]) -> None:
 def _safe_config_json(params: "AnyTerminalInstanceConfig", indent: Optional[int] = None) -> str:
     """Serialize config without secrets."""
 
-    def redact(value: Any) -> Any:
+    def redact(value: Any, key: str = "") -> Any:
+        normalized = key.lower()
+        if (
+            any(secret in normalized for secret in ("api_key", "apikey", "secret", "password"))
+            or normalized == "token"
+            or normalized.endswith("_token")
+        ):
+            return "***"
         if isinstance(value, dict):
-            return {
-                key: (
-                    "***"
-                    if any(secret in key.lower() for secret in ("api_key", "secret", "password", "token"))
-                    else redact(item)
-                )
-                for key, item in value.items()
-            }
+            return {item_key: redact(item, item_key) for item_key, item in value.items()}
         if isinstance(value, list):
             return [redact(item) for item in value]
         return value
@@ -280,6 +281,7 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     # model server on host loopback; None uses the docker default (e.g. for a remote server).
     docker_network: Optional[str] = "host"
     sandbox_model_base_url: Optional[str] = None
+    agent_runtime_source: str = "auto"
     tb_agent_timeout: int = 1800
     tb_eval_timeout: int = 300
     tb_sandbox_ttl: int = 7200
@@ -301,6 +303,7 @@ class AnyTerminalServerConfig(BaseModel):
     nemo_gym_root: Path
     agent_deps_dir: Path
     agent_deps_archive: Optional[Path] = None
+    agent_deps_url: Optional[str] = None
 
 
 class AnyTerminalInstanceConfig(AnyTerminalAgentConfig, AnyTerminalServerConfig):
@@ -427,16 +430,41 @@ class RunTerminalAgent(BaseModel):
             raise RuntimeError(result.stderr or "failed to create sandbox runtime directories")
         await sandbox.upload(cfg.persistent_dir / "instruction.txt", "/trajectories_mount/instruction.txt")
         await sandbox.upload(cfg.persistent_dir / "agent_runner.py", "/trajectories_mount/agent_runner.py")
-        if cfg.agent_deps_archive is None:
-            raise RuntimeError("remote sandbox requires an agent runtime archive")
-        await sandbox.upload(cfg.agent_deps_archive, "/tmp/anyterminal-agent-deps.tar.gz")
-        result = await sandbox.exec(
-            "tar -xzf /tmp/anyterminal-agent-deps.tar.gz -C /agent_deps_mount",
-            timeout_s=900,
-            user="root",
-        )
-        if result.return_code != 0:
-            raise RuntimeError(result.stderr or "failed to extract agent runtime")
+        external_runtime = cfg.agent_deps_archive is not None or cfg.agent_deps_url is not None
+        if cfg.agent_deps_archive is not None:
+            await sandbox.upload(cfg.agent_deps_archive, "/tmp/anyterminal-agent-deps.tar.gz")
+        elif cfg.agent_deps_url is not None:
+            runtime_url = shlex.quote(cfg.agent_deps_url)
+            python_fetch = shlex.quote(
+                "import urllib.request; "
+                f"urllib.request.urlretrieve({cfg.agent_deps_url!r}, '/tmp/anyterminal-agent-deps.tar.gz')"
+            )
+            result = await sandbox.exec(
+                "if command -v curl >/dev/null 2>&1; then "
+                f"curl -fsSL -o /tmp/anyterminal-agent-deps.tar.gz {runtime_url}; "
+                "elif command -v wget >/dev/null 2>&1; then "
+                f"wget -qO /tmp/anyterminal-agent-deps.tar.gz {runtime_url}; "
+                "elif command -v python3 >/dev/null 2>&1; then "
+                f"python3 -c {python_fetch}; "
+                "else echo 'runtime download requires curl, wget, or python3' >&2; exit 127; fi",
+                timeout_s=1200,
+                user="root",
+            )
+            if result.return_code != 0:
+                raise RuntimeError(result.stderr or "failed to fetch agent runtime")
+        else:
+            result = await sandbox.exec("test -x /agent_deps_mount/bin/python", timeout_s=30, user="root")
+            if result.return_code != 0:
+                raise RuntimeError("task image does not contain /agent_deps_mount/bin/python")
+        if external_runtime:
+            result = await sandbox.exec(
+                "tar -xzf /tmp/anyterminal-agent-deps.tar.gz -C /agent_deps_mount && "
+                "rm -f /tmp/anyterminal-agent-deps.tar.gz",
+                timeout_s=900,
+                user="root",
+            )
+            if result.return_code != 0:
+                raise RuntimeError(result.stderr or "failed to extract agent runtime")
 
     async def _stage_remote_tests(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
         archive = await asyncio.to_thread(self._archive, cfg.persistent_dir / "staging" / "tests")
@@ -612,9 +640,28 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         model_name = str(self.server_client.global_config_dict.get("policy_model_name") or "")
 
         workspace = Path(__file__).parent
-        agent_deps_dir = GymAgentHarnessProcessor(config=self.config).setup()
+        provider_name = next(iter(self.config.sandbox_provider), "docker")
+        remote_provider = provider_name not in {"apptainer", "docker"}
+        runtime_source = self.config.agent_runtime_source
+        agent_deps_dir = workspace
         agent_deps_archive = None
-        if next(iter(self.config.sandbox_provider), "docker") not in {"apptainer", "docker"}:
+        agent_deps_url = None
+        if runtime_source == "auto":
+            agent_deps_dir = GymAgentHarnessProcessor(config=self.config).setup()
+        elif runtime_source == "baked":
+            if not remote_provider:
+                raise ValueError("agent_runtime_source=baked is only valid for remote sandbox providers")
+        elif "://" in runtime_source:
+            if not remote_provider:
+                raise ValueError("URL agent_runtime_source is only valid for remote sandbox providers")
+            agent_deps_url = runtime_source
+        else:
+            if not remote_provider:
+                raise ValueError("archive agent_runtime_source is only valid for remote sandbox providers")
+            agent_deps_archive = Path(runtime_source).expanduser()
+            if not agent_deps_archive.is_file():
+                raise ValueError(f"agent runtime archive not found: {agent_deps_archive}")
+        if remote_provider and runtime_source == "auto":
             agent_deps_archive = workspace / f".{agent_deps_dir.name}.tar.gz"
             sentinel = agent_deps_dir / ".installed"
             if not agent_deps_archive.exists() or agent_deps_archive.stat().st_mtime < sentinel.stat().st_mtime:
@@ -640,6 +687,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
             nemo_gym_root=PARENT_DIR,
             agent_deps_dir=agent_deps_dir,
             agent_deps_archive=agent_deps_archive,
+            agent_deps_url=agent_deps_url,
         )
         super().model_post_init(context)
 

@@ -1,0 +1,320 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+from nemo_gym.global_config import SKILLS_REF_KEY_NAME
+from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.server_utils import ServerClient
+from responses_api_agents.nemo_fabric_agent.app import (
+    NeMoFabricAgent,
+    NeMoFabricAgentConfig,
+    NeMoFabricAgentRunRequest,
+    _adapter_response,
+    _content_text,
+    _extract_request_input,
+    _mapping,
+    _normalized_usage,
+    _response_text,
+    _skill_paths,
+    _turns_used,
+    _usage_value,
+)
+
+
+def _config(**kwargs) -> NeMoFabricAgentConfig:
+    kwargs.setdefault("resources_server", ResourcesServerRef(type="resources_servers", name="resources"))
+    kwargs.setdefault("model_server", ModelServerRef(type="responses_api_models", name="policy_model"))
+    kwargs.setdefault("adapter_id", "nvidia.fabric.hermes")
+    kwargs.setdefault("model_provider", "openai")
+    kwargs.setdefault("model", "gym-policy-model")
+    return NeMoFabricAgentConfig(host="0.0.0.0", port=8080, entrypoint="", name="fabric", **kwargs)
+
+
+def _agent(**kwargs) -> NeMoFabricAgent:
+    return NeMoFabricAgent(config=_config(**kwargs), server_client=MagicMock(spec=ServerClient))
+
+
+class _FakeHttpResponse:
+    ok = True
+
+    def __init__(self, payload: dict, cookies: dict | None = None) -> None:
+        self.payload = payload
+        self.cookies = cookies or {}
+
+    async def read(self) -> bytes:
+        import orjson
+
+        return orjson.dumps(self.payload)
+
+
+class _FakeOutput(dict):
+    def to_mapping(self) -> dict:
+        return dict(self)
+
+
+class _FakeResult:
+    status = "succeeded"
+    error = None
+
+    def __init__(self) -> None:
+        self.output = _FakeOutput(
+            response="fabric answer",
+            model="gym-policy-model",
+            api_calls=2,
+            usage={"input_tokens": 3, "output_tokens": 4, "cached_input_tokens": 1},
+        )
+
+    def to_mapping(self) -> dict:
+        return {
+            "status": self.status,
+            "output": dict(self.output),
+            "request_id": "request-1",
+        }
+
+
+def test_extract_request_input_keeps_multiturn_messages_structured() -> None:
+    body = NeMoGymResponseCreateParamsNonStreaming.model_validate(
+        {
+            "input": [
+                {"role": "system", "content": "system", "type": "message"},
+                {"role": "user", "content": "old", "type": "message"},
+                {"role": "developer", "content": "developer", "type": "message"},
+                {"role": "user", "content": "latest", "type": "message"},
+            ]
+        }
+    )
+
+    request_input, instructions = _extract_request_input(body.input)
+    assert [message["role"] for message in request_input] == ["user", "user"]
+    assert instructions == "system\n\ndeveloper"
+
+
+def test_content_and_response_normalizers_handle_generic_values() -> None:
+    part = MagicMock(text="object")
+
+    assert _content_text(None) == ""
+    assert _content_text([{"text": "dict"}, part, {"ignored": True}]) == "dictobject"
+    assert _extract_request_input("plain prompt") == ("plain prompt", None)
+    assert _mapping(_FakeOutput(answer=1)) == {"answer": 1}
+    assert _mapping(None) == {}
+    assert _usage_value({"first": True, "second": -1, "third": 7}, "first", "second", "third") == 7
+    assert _usage_value({}, "missing") == 0
+    assert _response_text(None) == ""
+    assert _response_text({"answer": 42}) == '{"answer": 42}'
+
+
+def test_normalized_usage_supports_canonical_and_adapter_shapes() -> None:
+    canonical = _normalized_usage(
+        {"usage": {"input_tokens": 2, "output_tokens": 3, "extensions": {"reasoning_tokens": 1}}},
+        {},
+    )
+    adapter = _normalized_usage(
+        {},
+        {
+            "usage": {
+                "total": {
+                    "inputTokens": 11,
+                    "outputTokens": 7,
+                    "reasoningOutputTokens": 5,
+                    "cachedInputTokens": 4,
+                    "totalTokens": 18,
+                }
+            }
+        },
+    )
+
+    assert canonical == {
+        "input_tokens": 2,
+        "output_tokens": 3,
+        "reasoning_tokens": 1,
+        "extensions": {"reasoning_tokens": 1},
+    }
+    assert adapter["reasoningOutputTokens"] == 5
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ({"num_turns": 4}, 4),
+        ({"api_calls": 5}, 5),
+        ({"usage": {"api_calls": 6}}, 6),
+        ({"turns_used": 3, "api_calls": 8}, 3),
+        ({"num_turns": True}, 1),
+        ({}, 1),
+    ],
+)
+def test_turns_used_supports_adapter_shapes(output: dict, expected: int) -> None:
+    assert _turns_used(output) == expected
+
+
+def test_adapter_response_supports_harness_specific_final_output() -> None:
+    assert _adapter_response({"response": "deep agents"}) == "deep agents"
+    assert _adapter_response({"output": "mini swe"}) == "mini swe"
+    assert _adapter_response({"submission": "fallback"}) == "fallback"
+    assert _adapter_response({"custom": "generic"}) == {"custom": "generic"}
+
+
+def test_skill_paths_expands_gym_variant(tmp_path: Path) -> None:
+    for name in ("alpha", "beta"):
+        skill = tmp_path / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+    (tmp_path / "ignored").mkdir()
+
+    assert _skill_paths(str(tmp_path)) == [str(tmp_path / "alpha"), str(tmp_path / "beta")]
+
+
+def test_skill_paths_accepts_one_skill_and_rejects_invalid_roots(tmp_path: Path) -> None:
+    assert _skill_paths(None) == []
+    with pytest.raises(ValueError, match="not a directory"):
+        _skill_paths(str(tmp_path / "missing"))
+
+    (tmp_path / "SKILL.md").write_text("---\nname: root\n---\n")
+    assert _skill_paths(str(tmp_path)) == [str(tmp_path)]
+    (tmp_path / "SKILL.md").unlink()
+    with pytest.raises(ValueError, match="contains no SKILL.md"):
+        _skill_paths(str(tmp_path))
+
+
+def test_fabric_config_injects_model_workspace_mcp_and_skills(tmp_path: Path) -> None:
+    agent = _agent(
+        system_prompt="agent instruction",
+        harness_settings={"sandbox": "danger-full-access"},
+        fabric_config={
+            "runtime": {"max_turns": 3},
+            "instructions": {"system": {"mode": "append"}, "project": {"enabled": False}},
+            "mcp": {
+                "servers": {"static": {"transport": "stdio", "url": "x"}},
+                "tool_policy": {"default": "allow"},
+            },
+            "skills": {"validation": "strict"},
+        },
+    )
+
+    config = agent._fabric_config(
+        model_base_url="http://model/ng-rollout/1/v1",
+        workspace=tmp_path,
+        system_prompt="dataset instruction",
+        mcp_servers={"dynamic": {"transport": "streamable-http", "url": "http://resources/mcp"}},
+        skills=[str(tmp_path / "skill")],
+    ).to_mapping()
+
+    assert config["harness"] == {
+        "adapter_id": "nvidia.fabric.hermes",
+        "settings": {"sandbox": "danger-full-access"},
+    }
+    assert config["models"]["default"]["base_url"] == "http://model/ng-rollout/1/v1"
+    assert config["environment"]["workspace"] == str(tmp_path)
+    assert config["runtime"] == {"timeout_seconds": 600.0, "max_turns": 3}
+    assert set(config["mcp"]["servers"]) == {"static", "dynamic"}
+    assert config["mcp"]["tool_policy"] == {"default": "allow"}
+    assert config["skills"]["paths"] == [str(tmp_path / "skill")]
+    assert config["skills"]["validation"] == "strict"
+    assert config["instructions"]["system"]["content"] == "dataset instruction"
+    assert config["instructions"]["project"] == {"enabled": False}
+
+
+def test_rollout_mcp_metadata_is_optional_and_headers_are_optional(caplog) -> None:
+    agent = _agent()
+    agent.server_client.global_config_dict = {
+        "resources": {"resources_servers": {"resources": {"host": "127.0.0.1", "port": 9001}}}
+    }
+    agent.server_client._build_server_base_url.return_value = "http://127.0.0.1:9001"
+
+    assert agent._rollout_mcp_servers({}) == {}
+    assert agent._rollout_mcp_servers({"mcp": {}}) == {
+        "resources": {"transport": "streamable-http", "url": "http://127.0.0.1:9001/mcp"}
+    }
+    assert "has no session headers" in caplog.text
+
+
+def test_run_preserves_fabric_result_and_verifies(tmp_path: Path) -> None:
+    agent = _agent(cwd=str(tmp_path))
+    agent.server_client.global_config_dict = {
+        "resources": {"resources_servers": {"resources": {"host": "127.0.0.1", "port": 9001}}},
+        "policy_model": {"responses_api_models": {"policy_model": {"host": "127.0.0.1", "port": 9002}}},
+    }
+    agent.server_client._build_server_base_url.side_effect = lambda config: f"http://{config['host']}:{config['port']}"
+
+    async def post(server_name, url_path, json=None, cookies=None, **kwargs):
+        if url_path == "/seed_session":
+            return _FakeHttpResponse(
+                {
+                    "mcp": {
+                        "server_name": "resources",
+                        "url_path": "/mcp",
+                        "headers": {"X-NeMo-Gym-Session-Token": "token"},
+                    }
+                },
+                cookies={"session": "seeded"},
+            )
+        assert url_path == "/verify"
+        assert json["response"]["output"][0]["content"][0]["text"] == "fabric answer"
+        return _FakeHttpResponse(json | {"reward": 1.0})
+
+    agent.server_client.post = AsyncMock(side_effect=post)
+    body = NeMoFabricAgentRunRequest.model_validate(
+        {
+            "responses_create_params": {"input": "question"},
+            SKILLS_REF_KEY_NAME: None,
+        }
+    )
+    request = MagicMock()
+    request.cookies = {}
+
+    fabric = MagicMock()
+    fabric.run = AsyncMock(return_value=_FakeResult())
+    with patch("responses_api_agents.nemo_fabric_agent.app.Fabric", return_value=fabric):
+        result = asyncio.run(agent.run(request, body))
+
+    assert result.reward == 1.0
+    assert result.fabric_result["request_id"] == "request-1"
+    assert result.turns_used == 2
+    assert result.response.usage.input_tokens == 3
+    assert result.response.usage.output_tokens == 4
+    called_config = fabric.run.call_args.args[0].to_mapping()
+    dynamic = called_config["mcp"]["servers"]["resources"]
+    assert dynamic["transport"] == "streamable-http"
+    assert dynamic["custom_headers"] == {"X-NeMo-Gym-Session-Token": "token"}
+
+
+def test_failed_fabric_result_raises(tmp_path: Path) -> None:
+    agent = _agent(cwd=str(tmp_path))
+    agent.server_client.global_config_dict = {
+        "policy_model": {"responses_api_models": {"policy_model": {"host": "127.0.0.1", "port": 9002}}}
+    }
+    agent.server_client._build_server_base_url.side_effect = lambda config: f"http://{config['host']}:{config['port']}"
+    failed = _FakeResult()
+    failed.status = "failed"
+    failed.error = MagicMock(message="adapter exploded")
+    fabric = MagicMock()
+    fabric.run = AsyncMock(return_value=failed)
+
+    with patch("responses_api_agents.nemo_fabric_agent.app.Fabric", return_value=fabric):
+        with pytest.raises(RuntimeError, match="adapter exploded"):
+            asyncio.run(agent._create_response(NeMoGymResponseCreateParamsNonStreaming(input="question")))
+
+
+def test_responses_forwards_rollout_id_and_invalid_cwd_is_rejected(tmp_path: Path) -> None:
+    agent = _agent(cwd=str(tmp_path / "missing"))
+    agent.server_client.global_config_dict = {
+        "policy_model": {"responses_api_models": {"policy_model": {"host": "127.0.0.1", "port": 9002}}}
+    }
+    agent.server_client._build_server_base_url.return_value = "http://127.0.0.1:9002"
+    with pytest.raises(ValueError, match="configured cwd is not a directory"):
+        asyncio.run(agent._create_response(NeMoGymResponseCreateParamsNonStreaming(input="question")))
+
+    expected = MagicMock()
+    agent._create_response = AsyncMock(return_value=(expected, {}))
+    request = MagicMock()
+    request.path_params = {"rollout_id": "rollout-7"}
+    result = asyncio.run(agent.responses(request, NeMoGymResponseCreateParamsNonStreaming(input="question")))
+
+    assert result is expected
+    assert agent._create_response.await_args.kwargs == {"rollout_id": "rollout-7"}
