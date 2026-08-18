@@ -100,8 +100,8 @@ class TokenIdCaptureSettings(BaseModel):
     # Optional paired reader for framework-owned transports.
     source: str | None = None
     source_kwargs: dict[str, Any] = Field(default_factory=dict)
-    # Whether Gym reads a rollout's records back after it finishes, builds the trajectory, swaps
-    # it into response.output, attaches build metrics, and retires the sealed snapshot.
+    # Whether Gym rebuilds the response from frozen capture records.
+    # Successful durable delivery retires the consumed snapshot.
     rebuild_response: bool = True
 
 
