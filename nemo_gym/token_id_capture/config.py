@@ -51,7 +51,11 @@ Programmatic installation must occur inside the serving process.
 Choosing who reads them back
 ----------------------------
 ``rebuild_response`` controls whether Gym rebuilds a finished rollout.
-Gym then swaps the rebuilt trajectory into ``response.output``.
+Gym freezes captured records before rebuilding ``response.output``.
+Rebuilding does not retire the frozen snapshot.
+Gym retires a successful build only after durable handoff.
+Retirement uses the frozen ``snapshot_id`` and version.
+Failed or masked builds retain their capture evidence.
 Set it to false when a framework reads through its own ``TokenSource``.
 Gym then stops after the write.
 Read ownership is independent of write ownership.
@@ -100,8 +104,9 @@ class TokenIdCaptureSettings(BaseModel):
     # Optional paired reader for framework-owned transports.
     source: str | None = None
     source_kwargs: dict[str, Any] = Field(default_factory=dict)
-    # Whether Gym rebuilds the response from frozen capture records.
-    # Successful durable delivery retires the consumed snapshot.
+    # Whether Gym freezes capture records and rebuilds the response.
+    # Finalization does not retire the frozen snapshot.
+    # Durable delivery permits retirement by snapshot id and version.
     rebuild_response: bool = True
 
 
